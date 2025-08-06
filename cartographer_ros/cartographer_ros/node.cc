@@ -219,26 +219,34 @@ void Node::AddSensorSamplers(const int trajectory_id,
           options.landmarks_sampling_ratio));
 }
 
+
+
 void Node::PublishLocalTrajectoryData(const ::ros::TimerEvent& timer_event) {
   absl::MutexLock lock(&mutex_);
+  
+  // 获取感兴趣点的位置和姿态（通过参数服务器）
+  double point_of_interest_x, point_of_interest_y, point_of_interest_z;
+  double point_of_interest_qx, point_of_interest_qy, point_of_interest_qz, point_of_interest_qw;
+  node_handle_.param("point_of_interest/x", point_of_interest_x, 0.0);
+  node_handle_.param("point_of_interest/y", point_of_interest_y, 0.0);
+  node_handle_.param("point_of_interest/z", point_of_interest_z, 0.0);
+  node_handle_.param("point_of_interest/qx", point_of_interest_qx, 0.0);
+  node_handle_.param("point_of_interest/qy", point_of_interest_qy, 0.0);
+  node_handle_.param("point_of_interest/qz", point_of_interest_qz, 0.0);
+  node_handle_.param("point_of_interest/qw", point_of_interest_qw, 1.0); // 默认单位四元数
+
   for (const auto& entry : map_builder_bridge_.GetLocalTrajectoryData()) {
     const auto& trajectory_data = entry.second;
-
     auto& extrapolator = extrapolators_.at(entry.first);
-    // We only publish a point cloud if it has changed. It is not needed at high
-    // frequency, and republishing it would be computationally wasteful.
-    if (trajectory_data.local_slam_data->time !=
-        extrapolator.GetLastPoseTime()) {
+
+    // 处理点云发布（原代码保持不变）
+    if (trajectory_data.local_slam_data->time != extrapolator.GetLastPoseTime()) {
       if (scan_matched_point_cloud_publisher_.getNumSubscribers() > 0) {
-        // TODO(gaschler): Consider using other message without time
-        // information.
         carto::sensor::TimedPointCloud point_cloud;
-        point_cloud.reserve(trajectory_data.local_slam_data->range_data_in_local
-                                .returns.size());
+        point_cloud.reserve(trajectory_data.local_slam_data->range_data_in_local.returns.size());
         for (const cartographer::sensor::RangefinderPoint point :
              trajectory_data.local_slam_data->range_data_in_local.returns) {
-          point_cloud.push_back(cartographer::sensor::ToTimedRangefinderPoint(
-              point, 0.f /* time */));
+          point_cloud.push_back(cartographer::sensor::ToTimedRangefinderPoint(point, 0.f));
         }
         scan_matched_point_cloud_publisher_.publish(ToPointCloud2Message(
             carto::common::ToUniversal(trajectory_data.local_slam_data->time),
@@ -250,30 +258,26 @@ void Node::PublishLocalTrajectoryData(const ::ros::TimerEvent& timer_event) {
                            trajectory_data.local_slam_data->local_pose);
     }
 
-    geometry_msgs::TransformStamped stamped_transform;
-    // If we do not publish a new point cloud, we still allow time of the
-    // published poses to advance. If we already know a newer pose, we use its
-    // time instead. Since tf knows how to interpolate, providing newer
-    // information is better.
+    // 计算时间戳
     const ::cartographer::common::Time now = std::max(
         FromRos(ros::Time::now()), extrapolator.GetLastExtrapolatedTime());
+    geometry_msgs::TransformStamped stamped_transform;
     stamped_transform.header.stamp =
         node_options_.use_pose_extrapolator
             ? ToRos(now)
             : ToRos(trajectory_data.local_slam_data->time);
 
-    // Suppress publishing if we already published a transform at this time.
-    // Due to 2020-07 changes to geometry2, tf buffer will issue warnings for
-    // repeated transforms with the same timestamp.
     if (last_published_tf_stamps_.count(entry.first) &&
         last_published_tf_stamps_[entry.first] == stamped_transform.header.stamp)
       continue;
+
     last_published_tf_stamps_[entry.first] = stamped_transform.header.stamp;
 
     const Rigid3d tracking_to_local_3d =
         node_options_.use_pose_extrapolator
             ? extrapolator.ExtrapolatePose(now)
             : trajectory_data.local_slam_data->local_pose;
+
     const Rigid3d tracking_to_local = [&] {
       if (trajectory_data.trajectory_options.publish_frame_projected_to_2d) {
         return carto::transform::Embed3D(
@@ -282,25 +286,60 @@ void Node::PublishLocalTrajectoryData(const ::ros::TimerEvent& timer_event) {
       return tracking_to_local_3d;
     }();
 
-    const Rigid3d tracking_to_map =
-        trajectory_data.local_to_map * tracking_to_local;
+    const Rigid3d tracking_to_map = trajectory_data.local_to_map * tracking_to_local;
 
+    // 新增：计算感兴趣点相对于机器人坐标系的位姿
+    // 感兴趣点的位姿（位置和旋转，地图坐标系下）
+    Eigen::Vector3d point_position(point_of_interest_x, point_of_interest_y, point_of_interest_z);
+    Eigen::Quaterniond point_orientation(point_of_interest_qw, point_of_interest_qx,
+                                        point_of_interest_qy, point_of_interest_qz);
+    cartographer::transform::Rigid3d point_pose(point_position, point_orientation);
+
+    // 计算 map_to_tracking 变换（tracking_to_map 的逆）
+    Rigid3d map_to_tracking = tracking_to_map.inverse();
+
+    // 将感兴趣点的位姿从地图坐标系变换到机器人坐标系
+    Rigid3d point_in_tracking = map_to_tracking * point_pose;
+
+    // 发布相对位姿（位置和旋转）
+    geometry_msgs::PoseStamped relative_pose_msg;
+    relative_pose_msg.header.frame_id = trajectory_data.trajectory_options.tracking_frame;
+    relative_pose_msg.header.stamp = stamped_transform.header.stamp;
+    relative_pose_msg.pose.position.x = point_in_tracking.translation().x();
+    relative_pose_msg.pose.position.y = point_in_tracking.translation().y();
+    relative_pose_msg.pose.position.z = point_in_tracking.translation().z();
+    relative_pose_msg.pose.orientation.x = point_in_tracking.rotation().x();
+    relative_pose_msg.pose.orientation.y = point_in_tracking.rotation().y();
+    relative_pose_msg.pose.orientation.z = point_in_tracking.rotation().z();
+    relative_pose_msg.pose.orientation.w = point_in_tracking.rotation().w();
+
+    // 创建一个新的发布者（需在初始化时定义）
+    static ros::Publisher relative_pose_publisher =
+        node_handle_.advertise<geometry_msgs::PoseStamped>("relative_pose", 10);
+    relative_pose_publisher.publish(relative_pose_msg);
+
+    // （可选）打印相对位姿到日志
+    ROS_INFO_STREAM("Point of interest relative to robot: "
+                    << "x=" << point_in_tracking.translation().x()
+                    << ", y=" << point_in_tracking.translation().y()
+                    << ", z=" << point_in_tracking.translation().z()
+                    << ", qx=" << point_in_tracking.rotation().x()
+                    << ", qy=" << point_in_tracking.rotation().y()
+                    << ", qz=" << point_in_tracking.rotation().z()
+                    << ", qw=" << point_in_tracking.rotation().w());
+
+    // 原有 TF 和 tracked_pose 发布逻辑
     if (trajectory_data.published_to_tracking != nullptr) {
       if (node_options_.publish_to_tf) {
         if (trajectory_data.trajectory_options.provide_odom_frame) {
           std::vector<geometry_msgs::TransformStamped> stamped_transforms;
-
           stamped_transform.header.frame_id = node_options_.map_frame;
-          stamped_transform.child_frame_id =
-              trajectory_data.trajectory_options.odom_frame;
-          stamped_transform.transform =
-              ToGeometryMsgTransform(trajectory_data.local_to_map);
+          stamped_transform.child_frame_id = trajectory_data.trajectory_options.odom_frame;
+          stamped_transform.transform = ToGeometryMsgTransform(trajectory_data.local_to_map);
           stamped_transforms.push_back(stamped_transform);
 
-          stamped_transform.header.frame_id =
-              trajectory_data.trajectory_options.odom_frame;
-          stamped_transform.child_frame_id =
-              trajectory_data.trajectory_options.published_frame;
+          stamped_transform.header.frame_id = trajectory_data.trajectory_options.odom_frame;
+          stamped_transform.child_frame_id = trajectory_data.trajectory_options.published_frame;
           stamped_transform.transform = ToGeometryMsgTransform(
               tracking_to_local * (*trajectory_data.published_to_tracking));
           stamped_transforms.push_back(stamped_transform);
@@ -308,13 +347,13 @@ void Node::PublishLocalTrajectoryData(const ::ros::TimerEvent& timer_event) {
           tf_broadcaster_.sendTransform(stamped_transforms);
         } else {
           stamped_transform.header.frame_id = node_options_.map_frame;
-          stamped_transform.child_frame_id =
-              trajectory_data.trajectory_options.published_frame;
+          stamped_transform.child_frame_id = trajectory_data.trajectory_options.published_frame;
           stamped_transform.transform = ToGeometryMsgTransform(
               tracking_to_map * (*trajectory_data.published_to_tracking));
           tf_broadcaster_.sendTransform(stamped_transform);
         }
       }
+
       if (node_options_.publish_tracked_pose) {
         ::geometry_msgs::PoseStamped pose_msg;
         pose_msg.header.frame_id = node_options_.map_frame;

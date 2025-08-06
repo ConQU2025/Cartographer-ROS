@@ -21,6 +21,17 @@
 #include "cartographer_ros/ros_log_sink.h"
 #include "gflags/gflags.h"
 #include "tf2_ros/transform_listener.h"
+#include "cartographer_ros/msg_conversion.h"
+
+template<typename T>
+
+T getParam_Func(ros::NodeHandle& pnh,
+                    const std::string& param_name, const T & default_val)
+{
+  T param_val;
+  pnh.param<T>(param_name, param_val, default_val);
+  return param_val;
+}
 
 DEFINE_bool(collect_metrics, false,
             "Activates the collection of runtime metrics. If activated, the "
@@ -60,6 +71,35 @@ void Run() {
       cartographer::mapping::CreateMapBuilder(node_options.map_builder_options);
   Node node(node_options, std::move(map_builder), &tf_buffer,
             FLAGS_collect_metrics);
+
+  // 获取轨迹配置项指针
+auto trajectory_options_handle = &(trajectory_options);  //原博文这里少了个auto
+ros::NodeHandle pnh("~");
+// 获取配置参数
+bool localization = getParam_Func<bool>(pnh, "/localization", 0);      //是否为纯定位模式
+double pos_x = getParam_Func<double>(pnh, "/set_inital_pose_x", 0.0); 
+double pos_y = getParam_Func<double>(pnh, "/set_inital_pose_y", 0.0); 
+double pos_z = getParam_Func<double>(pnh, "/set_inital_pose_z", 0.0); 
+double pos_ox = getParam_Func<double>(pnh, "/set_inital_pose_ox", 0.0); 
+double pos_oy = getParam_Func<double>(pnh, "/set_inital_pose_oy", 0.0); 
+double pos_oz = getParam_Func<double>(pnh, "/set_inital_pose_oz", 0.0); 
+double pos_ow = getParam_Func<double>(pnh, "/set_inital_pose_ow", 1.0); 
+geometry_msgs::Pose init_pose;
+init_pose.position.x = pos_x;
+init_pose.position.y = pos_y;
+init_pose.position.z = pos_z;
+init_pose.orientation.x = pos_ox;
+init_pose.orientation.y = pos_oy;
+init_pose.orientation.z = pos_oz;
+init_pose.orientation.w = pos_ow;
+
+if(localization == true)
+{
+//更改轨迹配置项中的初始位姿值
+*trajectory_options_handle->trajectory_builder_options.mutable_initial_trajectory_pose()->mutable_relative_pose()
+    = cartographer::transform::ToProto(cartographer_ros::ToRigid3d(init_pose));
+}
+
   if (!FLAGS_load_state_filename.empty()) {
     node.LoadState(FLAGS_load_state_filename, FLAGS_load_frozen_state);
   }
